@@ -138,6 +138,12 @@ def prepare_requests(
                 messages, tokenize=True, add_generation_prompt=True,
             )
 
+        # Some tokenizer/transformers versions return a BatchEncoding/dict
+        # like {"input_ids": [...], "attention_mask": [...]} instead of a
+        # plain list of ids. Normalize to a list so len(ids) is the token count.
+        if hasattr(ids, "keys") and "input_ids" in ids:
+            ids = ids["input_ids"]
+
         if len(ids) > req_input_len:
             # Truncate: decode back to text from truncated ids
             # Keep the chat template structure by truncating user content
@@ -161,6 +167,8 @@ def prepare_requests(
                     test_ids = tokenizer.apply_chat_template(
                         msgs, tokenize=True, add_generation_prompt=True,
                     )
+                if hasattr(test_ids, "keys") and "input_ids" in test_ids:
+                    test_ids = test_ids["input_ids"]
                 if len(test_ids) >= req_input_len:
                     messages = msgs
                     actual_input_len = len(test_ids)
