@@ -165,5 +165,122 @@ class Engine:
             logits[:, -1, :], request.sampling_params, request.output_ids
         )
 
+    @torch.inference_mode()
+    def batched_decode(self, requests: list[Request]) -> list[int]:
+        """
+        Run one decode step for a batch of already-prefilled requests in a
+        single model forward pass.
+
+        Per-request KV caches have different sequence lengths, so we pad all
+        caches to ``max_cache_len`` along the sequence dim and build an
+        attention mask that hides padding positions.  After the forward, we
+        slice each request's real cache back out (old portion up to its
+        actual length, plus the single new token the model just appended).
+
+        Args:
+            requests: list of RUNNING requests (must have ``kv_cache`` set).
+
+        Returns:
+            A list of sampled token ids, one per input request.
+        """
+        if not requests:
+            return []
+
+        device = self.device
+        batch_size = len(requests)
+
+        # Per-layer KV caches live as (k, v) tuples on each request.  Every
+        # request has the same number of layers / heads / head_dim, only the
+        # seq dimension (cache length) differs between requests.
+        num_layers = len(requests[0].kv_cache)
+        sample_k = requests[0].kv_cache[0][0]
+        _, num_kv_heads, _, head_dim = sample_k.shape
+        kv_dtype = sample_k.dtype
+
+        # Cache lengths per request — used for padding, RoPE position ids,
+        # mask construction, and later KV-cache slicing.
+        cache_lens = [req.kv_cache[0][0].shape[2] for req in requests]
+        max_cache_len = max(cache_lens)
+
+        # Inputs: each request contributes its most recent output token and a
+        # position id equal to its current cache length (the slot the new
+        # token will occupy, independent of padding).
+        input_ids = torch.tensor(
+            [[req.output_ids[-1]] for req in requests],
+            dtype=torch.long,
+            device=device,
+        )
+        position_ids = torch.tensor(
+            [[cl] for cl in cache_lens], dtype=torch.long, device=device
+        )
+
+        # Pad per-layer KV caches to (batch, num_kv_heads, max_cache_len,
+        # head_dim).  Requests shorter than max_cache_len have trailing
+        # zeros that the attention mask will hide.
+        batched_kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_idx in range(num_layers):
+            k_padded = torch.zeros(
+                (batch_size, num_kv_heads, max_cache_len, head_dim),
+                dtype=kv_dtype,
+                device=device,
+            )
+            v_padded = torch.zeros_like(k_padded)
+            for i, req in enumerate(requests):
+                k_i, v_i = req.kv_cache[layer_idx]
+                seq_len_i = cache_lens[i]
+                k_padded[i, :, :seq_len_i, :] = k_i[0]
+                v_padded[i, :, :seq_len_i, :] = v_i[0]
+            batched_kv_caches.append((k_padded, v_padded))
+
+        # Additive attention mask of shape (batch, 1, 1, max_cache_len + 1).
+        # The "+ 1" accounts for the new token the attention layer will
+        # concatenate onto the cached K/V before computing attention.
+        # For request i, positions [cache_lens[i], max_cache_len) are pad
+        # (set to -inf).  Position `max_cache_len` is the new token and is
+        # always valid.  Positions [0, cache_lens[i]) are real cached tokens.
+        total_kv_len = max_cache_len + 1
+        attention_mask = torch.zeros(
+            (batch_size, 1, 1, total_kv_len), dtype=kv_dtype, device=device
+        )
+        for i, seq_len_i in enumerate(cache_lens):
+            if seq_len_i < max_cache_len:
+                attention_mask[i, 0, 0, seq_len_i:max_cache_len] = float("-inf")
+
+        # Single batched forward pass.
+        logits, new_kv_caches = self.model(
+            input_ids,
+            position_ids,
+            kv_caches=batched_kv_caches,
+            attention_mask=attention_mask,
+        )
+
+        # Rebuild per-request KV caches: keep the real old prefix [:, :, :L]
+        # and the newly appended token [:, :, -1:] — skipping the pad region
+        # in between.  This keeps each request's cache compact (no padding
+        # leaks into subsequent steps).
+        for i, req in enumerate(requests):
+            seq_len_i = cache_lens[i]
+            req_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for layer_idx in range(num_layers):
+                k_layer, v_layer = new_kv_caches[layer_idx]
+                k_old = k_layer[i : i + 1, :, :seq_len_i, :]
+                v_old = v_layer[i : i + 1, :, :seq_len_i, :]
+                k_new = k_layer[i : i + 1, :, -1:, :]
+                v_new = v_layer[i : i + 1, :, -1:, :]
+                req_kv.append(
+                    (torch.cat([k_old, k_new], dim=2), torch.cat([v_old, v_new], dim=2))
+                )
+            req.kv_cache = req_kv
+
+        # Per-request sampling — sampling params and output history differ
+        # between requests, so we cannot easily fuse this step.
+        token_ids: list[int] = []
+        for i, req in enumerate(requests):
+            tid = sample_token(
+                logits[i : i + 1, -1, :], req.sampling_params, req.output_ids
+            )
+            token_ids.append(tid)
+        return token_ids
+
     def is_stop_token(self, token_id: int) -> bool:
         return token_id in self.stop_token_ids

@@ -29,7 +29,19 @@ logger = logging.getLogger(__name__)
 
 class Scheduler:
     """
-    Naive FCFS scheduler — processes requests one at a time.
+    FCFS scheduler with iteration-level (continuous) batching.
+
+    Each scheduling step has two phases:
+        1. Admit up to ``max_running`` waiting requests and prefill each one
+           individually (prefill stays unbatched — variable prompt lengths
+           make batched prefill complex; prefill is a one-time cost).
+        2. Run a single batched forward pass that advances every currently
+           running request by one token.
+
+    Because phases 1 and 2 run every iteration, a newly admitted request
+    joins the running batch the same step it is prefilled, and a request
+    that finishes frees its slot for the very next step.  There is no
+    "drain the batch before admitting" barrier.
 
     Public API (thread-safe):
         add_request(req)   — enqueue a new request
@@ -101,35 +113,54 @@ class Scheduler:
 
     def step(self) -> list[Request]:
         """
-        One scheduling iteration — maximally naive.
+        One scheduling iteration with continuous batching.
 
-        Takes one request from the waiting queue, prefills it, and decodes
-        it to completion before moving on to the next request.  No batching,
-        no interleaving.
+        Phase 1: admit up to ``max_running - len(running)`` waiting requests
+        and prefill each one individually (RUNNING → has KV cache + first
+        output token).  Requests that finish at prefill (e.g. first token is
+        a stop token or ``max_new_tokens == 1``) are retired immediately.
+        The rest join the running set.
 
-        Returns list of requests that finished in this step.
+        Phase 2: if any requests are running, run ``batched_decode`` once —
+        a single forward pass that advances every running request by one
+        token.  Requests that finish are retired, freeing their slot for
+        the next step.
+
+        Returns:
+            List of requests that transitioned to FINISHED in this step.
         """
         finished: list[Request] = []
 
-        # ── Pick one request ────────────────────────────────────────────
+        # ── Phase 1: admit + prefill ────────────────────────────────────
         with self._lock:
-            if not self.waiting:
-                return finished
-            req = self.waiting.popleft()
+            admit_count = self.max_running - len(self.running)
+            to_prefill: list[Request] = []
+            while self.waiting and len(to_prefill) < admit_count:
+                to_prefill.append(self.waiting.popleft())
 
-        # ── Prefill ─────────────────────────────────────────────────────
-        req.status = RequestStatus.RUNNING
-        token_id = self.engine.prefill(req)
-        req.output_ids.append(token_id)
-        self._stream_token(req, token_id)
-
-        # ── Decode until finished ───────────────────────────────────────
-        while not self._check_finished(req, token_id):
-            token_id = self.engine.decode_step(req)
+        for req in to_prefill:
+            req.status = RequestStatus.RUNNING
+            token_id = self.engine.prefill(req)
             req.output_ids.append(token_id)
             self._stream_token(req, token_id)
+            if self._check_finished(req, token_id):
+                self._finish_request(req, finished)
+            else:
+                self.running.append(req)
 
-        self._finish_request(req, finished)
+        # ── Phase 2: batched decode all running requests ────────────────
+        if self.running:
+            token_ids = self.engine.batched_decode(self.running)
+            still_running: list[Request] = []
+            for req, token_id in zip(self.running, token_ids):
+                req.output_ids.append(token_id)
+                self._stream_token(req, token_id)
+                if self._check_finished(req, token_id):
+                    self._finish_request(req, finished)
+                else:
+                    still_running.append(req)
+            self.running = still_running
+
         return finished
 
     # ── Helpers ─────────────────────────────────────────────────────────
