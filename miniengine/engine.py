@@ -174,8 +174,9 @@ class Engine:
         Per-request KV caches have different sequence lengths, so we pad all
         caches to ``max_cache_len`` along the sequence dim and build an
         attention mask that hides padding positions.  After the forward, we
-        slice each request's real cache back out (old portion up to its
-        actual length, plus the single new token the model just appended).
+        scatter the newly-generated token from the trailing padding slot back
+        into each request's real cache_len position, then hand each request a
+        view into the padded tensor — no per-request torch.cat per layer.
 
         Args:
             requests: list of RUNNING requests (must have ``kv_cache`` set).
@@ -253,24 +254,42 @@ class Engine:
             kv_caches=batched_kv_caches,
             attention_mask=attention_mask,
         )
+        # The pre-forward padded input is no longer needed — drop it so the
+        # allocator can reuse the storage instead of holding old + new KV
+        # buffers concurrently.
+        del batched_kv_caches
 
-        # Rebuild per-request KV caches: keep the real old prefix [:, :, :L]
-        # and the newly appended token [:, :, -1:] — skipping the pad region
-        # in between.  This keeps each request's cache compact (no padding
-        # leaks into subsequent steps).
+        # Vectorized KV cache rebuild.
+        #
+        # The forward left the new token at the trailing slot (index
+        # max_cache_len) of every layer's batched K/V.  Request i's real
+        # cache ends at position cache_lens[i] — the slots in between are
+        # the zero padding we initialized.  We scatter the new token into
+        # position cache_lens[i] per row, then hand each request a view
+        # [:, :, :cache_lens[i] + 1, :] into the padded tensor.
+        #
+        # Cost: one indexed-assign per layer (2 × num_layers kernel launches)
+        # vs. the old approach of batch × num_layers × 2 torch.cats — at
+        # batch=16 that's 72 launches vs 1152.  Each request's kv_cache is
+        # now a view into the padded buffer; the padded storage stays alive
+        # via those views until the next step replaces them.
+        cache_lens_t = torch.tensor(cache_lens, dtype=torch.long, device=device)
+        batch_idx_t = torch.arange(batch_size, device=device)
+        for k_layer, v_layer in new_kv_caches:
+            # Clone before assigning — advanced-index assignment with an
+            # aliased source can tear when the destination position equals
+            # the source position (request i with cache_lens[i] == max_cache_len).
+            k_new = k_layer[:, :, -1, :].clone()  # (batch, kv_heads, head_dim)
+            v_new = v_layer[:, :, -1, :].clone()
+            k_layer[batch_idx_t, :, cache_lens_t, :] = k_new
+            v_layer[batch_idx_t, :, cache_lens_t, :] = v_new
+
         for i, req in enumerate(requests):
-            seq_len_i = cache_lens[i]
-            req_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for layer_idx in range(num_layers):
-                k_layer, v_layer = new_kv_caches[layer_idx]
-                k_old = k_layer[i : i + 1, :, :seq_len_i, :]
-                v_old = v_layer[i : i + 1, :, :seq_len_i, :]
-                k_new = k_layer[i : i + 1, :, -1:, :]
-                v_new = v_layer[i : i + 1, :, -1:, :]
-                req_kv.append(
-                    (torch.cat([k_old, k_new], dim=2), torch.cat([v_old, v_new], dim=2))
-                )
-            req.kv_cache = req_kv
+            new_len = cache_lens[i] + 1
+            req.kv_cache = [
+                (k_layer[i : i + 1, :, :new_len, :], v_layer[i : i + 1, :, :new_len, :])
+                for k_layer, v_layer in new_kv_caches
+            ]
 
         # Per-request sampling — sampling params and output history differ
         # between requests, so we cannot easily fuse this step.
