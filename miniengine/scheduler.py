@@ -115,11 +115,13 @@ class Scheduler:
         """
         One scheduling iteration with continuous batching.
 
-        Phase 1: admit up to ``max_running - len(running)`` waiting requests
-        and prefill each one individually (RUNNING → has KV cache + first
-        output token).  Requests that finish at prefill (e.g. first token is
-        a stop token or ``max_new_tokens == 1``) are retired immediately.
-        The rest join the running set.
+        Phase 1: admit at most one waiting request per step and prefill it
+        (RUNNING → has KV cache + first output token).  Capping at one
+        prefill bounds the time a step can spend blocking already-running
+        requests from decoding — under a burst of arrivals we would
+        otherwise prefill N requests back-to-back before the next decode.
+        The newly admitted request joins the decode batch on the same step
+        (continuous batching preserved).
 
         Phase 2: if any requests are running, run ``batched_decode`` once —
         a single forward pass that advances every running request by one
@@ -131,11 +133,11 @@ class Scheduler:
         """
         finished: list[Request] = []
 
-        # ── Phase 1: admit + prefill ────────────────────────────────────
+        # ── Phase 1: admit + prefill (capped at 1 per step) ─────────────
         with self._lock:
-            admit_count = self.max_running - len(self.running)
+            have_capacity = len(self.running) < self.max_running
             to_prefill: list[Request] = []
-            while self.waiting and len(to_prefill) < admit_count:
+            if have_capacity and self.waiting:
                 to_prefill.append(self.waiting.popleft())
 
         for req in to_prefill:

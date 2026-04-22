@@ -205,32 +205,26 @@ class Engine:
 
         # Inputs: each request contributes its most recent output token and a
         # position id equal to its current cache length (the slot the new
-        # token will occupy, independent of padding).
-        input_ids = torch.tensor(
-            [[req.output_ids[-1]] for req in requests],
+        # token will occupy, independent of padding).  Build both in a single
+        # tensor-from-list + H2D transfer, then split with views.
+        combined = torch.tensor(
+            [[req.output_ids[-1], cl] for req, cl in zip(requests, cache_lens)],
             dtype=torch.long,
             device=device,
         )
-        position_ids = torch.tensor(
-            [[cl] for cl in cache_lens], dtype=torch.long, device=device
-        )
+        input_ids = combined[:, 0:1]
+        position_ids = combined[:, 1:2]
 
         # Pad per-layer KV caches to (batch, num_kv_heads, max_cache_len,
-        # head_dim).  Requests shorter than max_cache_len have trailing
-        # zeros that the attention mask will hide.
+        # head_dim) via pad_sequence.  Each per-request tensor is
+        # (1, H, L_i, D) — squeeze the batch-of-1 and transpose to put the
+        # seq dim first so pad_sequence can pad it; transpose back after.
         batched_kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_idx in range(num_layers):
-            k_padded = torch.zeros(
-                (batch_size, num_kv_heads, max_cache_len, head_dim),
-                dtype=kv_dtype,
-                device=device,
-            )
-            v_padded = torch.zeros_like(k_padded)
-            for i, req in enumerate(requests):
-                k_i, v_i = req.kv_cache[layer_idx]
-                seq_len_i = cache_lens[i]
-                k_padded[i, :, :seq_len_i, :] = k_i[0]
-                v_padded[i, :, :seq_len_i, :] = v_i[0]
+            k_seqs = [req.kv_cache[layer_idx][0].squeeze(0).transpose(0, 1) for req in requests]
+            v_seqs = [req.kv_cache[layer_idx][1].squeeze(0).transpose(0, 1) for req in requests]
+            k_padded = torch.nn.utils.rnn.pad_sequence(k_seqs, batch_first=True).transpose(1, 2)
+            v_padded = torch.nn.utils.rnn.pad_sequence(v_seqs, batch_first=True).transpose(1, 2)
             batched_kv_caches.append((k_padded, v_padded))
 
         # Additive attention mask of shape (batch, 1, 1, max_cache_len + 1).
@@ -240,12 +234,17 @@ class Engine:
         # (set to -inf).  Position `max_cache_len` is the new token and is
         # always valid.  Positions [0, cache_lens[i]) are real cached tokens.
         total_kv_len = max_cache_len + 1
+        # Vectorized construction: `positions >= cache_len[i]` identifies pad
+        # slots per row; multiply a constant -inf mask by that boolean.
+        # The trailing new-token slot (index max_cache_len) is outside this
+        # comparison and stays 0 (valid).
+        positions = torch.arange(max_cache_len, device=device)
+        cache_lens_t = torch.tensor(cache_lens, device=device)
+        pad_mask = positions.unsqueeze(0) >= cache_lens_t.unsqueeze(1)  # (batch, max_cache_len)
         attention_mask = torch.zeros(
             (batch_size, 1, 1, total_kv_len), dtype=kv_dtype, device=device
         )
-        for i, seq_len_i in enumerate(cache_lens):
-            if seq_len_i < max_cache_len:
-                attention_mask[i, 0, 0, seq_len_i:max_cache_len] = float("-inf")
+        attention_mask[:, 0, 0, :max_cache_len].masked_fill_(pad_mask, float("-inf"))
 
         # Single batched forward pass.
         logits, new_kv_caches = self.model(
