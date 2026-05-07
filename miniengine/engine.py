@@ -27,7 +27,8 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from miniengine.core import Request
-from miniengine.model import CausalLM, ModelConfig, load_weights
+from miniengine.kv_memory_pool import KVMemoryPool
+from miniengine.model import CausalLM, ModelConfig, PagedMeta, load_weights
 from miniengine.sampler import sample_token
 
 logger = logging.getLogger(__name__)
@@ -42,10 +43,19 @@ class Engine:
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         mode: str = "batched",
+        mem_fraction_static: float = 0.85,
+        page_size: int = 32,
+        torch_compile: bool = False,
     ):
         self.device = device
         self.dtype = dtype
         self.mode = mode
+        self.mem_fraction_static = mem_fraction_static
+        self.page_size = page_size
+        self.torch_compile = torch_compile
+
+        # Populated below when mode == "paged".
+        self.pool: KVMemoryPool | None = None
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)
@@ -94,6 +104,62 @@ class Engine:
             len(self.tokenizer),
             self.stop_token_ids,
             sum(p.numel() for p in self.model.parameters()) // 1_000_000,
+        )
+
+        # ── Paged KV pool (milestone 2) ────────────────────────────────
+        if mode == "paged":
+            self._init_kv_pool(config)
+
+    # ── Paged KV pool init ──────────────────────────────────────────────
+
+    def _init_kv_pool(self, config: ModelConfig) -> None:
+        """Allocate the paged KV pool sized from --mem-fraction-static.
+
+        Budget = total_gpu_mem * mem_fraction_static
+                 - bytes_used_by_weights
+                 - 5% safety margin (activations / fragmentation).
+        """
+        if not self.device.startswith("cuda"):
+            raise RuntimeError("--mode paged requires --device cuda")
+
+        device_idx = (
+            torch.device(self.device).index
+            if torch.device(self.device).index is not None
+            else torch.cuda.current_device()
+        )
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_idx)
+
+        weights_bytes = sum(
+            p.numel() * p.element_size() for p in self.model.parameters()
+        )
+        static_budget = int(total_bytes * self.mem_fraction_static)
+        safety_margin = int(0.05 * total_bytes)
+        pool_budget = static_budget - weights_bytes - safety_margin
+        if pool_budget <= 0:
+            raise RuntimeError(
+                f"KV pool budget non-positive: total={total_bytes / 1e9:.1f} GB, "
+                f"weights={weights_bytes / 1e9:.1f} GB, "
+                f"mem_fraction_static={self.mem_fraction_static}. "
+                "Lower --mem-fraction-static or use a smaller model."
+            )
+
+        self.pool = KVMemoryPool.from_budget(
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            page_size=self.page_size,
+            dtype=self.dtype,
+            device=self.device,
+            bytes_budget=pool_budget,
+        )
+        logger.info(
+            "KV pool ready  —  %d pages × %d tokens (%.2f GB), "
+            "weights=%.2f GB, total_gpu=%.2f GB",
+            self.pool.num_pages,
+            self.page_size,
+            (pool_budget) / 1e9,
+            weights_bytes / 1e9,
+            total_bytes / 1e9,
         )
 
     # ── Tokenization ────────────────────────────────────────────────────
@@ -264,3 +330,172 @@ class Engine:
                 )
             )
         return token_ids
+
+    # ── Paged path (milestone 2) ────────────────────────────────────────
+
+    @torch.inference_mode()
+    def prefill_packed(self, requests: list[Request]) -> list[int]:
+        """Packed batched prefill over the paged KV pool.
+
+        Allocates pages for each request, packs all prompts into a
+        single forward pass, scatters the resulting K/V into the pool,
+        and returns the first sampled token per request.
+        """
+        if not requests:
+            return []
+        assert self.pool is not None
+        page_size = self.pool.page_size
+
+        # Allocate pages and stamp each request's page table / KV length.
+        for req in requests:
+            seq_len = req.num_input_tokens
+            num_pages = self.pool.pages_needed(seq_len)
+            req.page_table = self.pool.allocate(num_pages)
+            req.num_kv_tokens = seq_len
+
+        seq_lens = [r.num_input_tokens for r in requests]
+        total_tokens = sum(seq_lens)
+
+        # Packed input_ids / position_ids (positions restart per request).
+        flat_input_ids: list[int] = []
+        flat_positions: list[int] = []
+        for req, s in zip(requests, seq_lens):
+            flat_input_ids.extend(req.input_ids)
+            flat_positions.extend(range(s))
+        input_ids = torch.tensor(
+            flat_input_ids, dtype=torch.long, device=self.device
+        ).unsqueeze(0)  # (1, total_tokens)
+        position_ids = torch.tensor(
+            flat_positions, dtype=torch.long, device=self.device
+        ).unsqueeze(0)  # (1, total_tokens)
+
+        # cu_seqlens (Python list — used for slicing q per request inside attn)
+        cu_seqlens: list[int] = [0]
+        for s in seq_lens:
+            cu_seqlens.append(cu_seqlens[-1] + s)
+
+        # slot_mapping: one entry per packed token, in packed order.
+        slot_mapping = self._build_slot_mapping(requests, seq_lens, page_size)
+
+        # block_table padded to max blocks across the batch.
+        block_table = self._build_block_table(requests)
+
+        paged_meta = PagedMeta(
+            is_prefill=True,
+            page_size=page_size,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            cu_seqlens=cu_seqlens,
+            cache_seqlens=list(seq_lens),
+        )
+
+        logits = self.model.forward_paged(
+            input_ids, position_ids, self.pool.kv_caches, paged_meta
+        )  # (1, total_tokens, vocab)
+
+        # Sample first token from each request's last position.
+        token_ids: list[int] = []
+        for i, req in enumerate(requests):
+            last_idx = cu_seqlens[i + 1] - 1
+            token_ids.append(
+                sample_token(
+                    logits[:, last_idx, :], req.sampling_params, req.output_ids
+                )
+            )
+        return token_ids
+
+    @torch.inference_mode()
+    def decode_paged(self, requests: list[Request]) -> list[int]:
+        """One paged decode step for every running request.
+
+        Allocates a fresh page for any request that's about to overflow
+        its current last page, scatters the new K/V into the pool, runs
+        attention through the per-request page table, and samples one
+        new token per request.
+        """
+        if not requests:
+            return []
+        assert self.pool is not None
+        page_size = self.pool.page_size
+
+        # Grow page tables and bump KV lengths.
+        for req in requests:
+            new_pos = req.num_kv_tokens  # 0-indexed slot of the new token
+            if new_pos // page_size >= len(req.page_table):
+                req.page_table.extend(self.pool.allocate(1))
+            req.num_kv_tokens += 1
+
+        bsz = len(requests)
+        # input_ids: (B, 1) — last generated token per request.
+        input_ids = torch.tensor(
+            [[r.output_ids[-1]] for r in requests],
+            dtype=torch.long,
+            device=self.device,
+        )
+        # position_ids: (B, 1) — index of the new KV slot.
+        position_ids = torch.tensor(
+            [[r.num_kv_tokens - 1] for r in requests],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        slot_mapping = self._build_decode_slot_mapping(requests, page_size)
+        block_table = self._build_block_table(requests)
+
+        paged_meta = PagedMeta(
+            is_prefill=False,
+            page_size=page_size,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            cu_seqlens=list(range(bsz + 1)),
+            cache_seqlens=[r.num_kv_tokens for r in requests],
+        )
+
+        logits = self.model.forward_paged(
+            input_ids, position_ids, self.pool.kv_caches, paged_meta
+        )  # (B, 1, vocab)
+
+        token_ids: list[int] = []
+        for i, req in enumerate(requests):
+            token_ids.append(
+                sample_token(
+                    logits[i : i + 1, -1, :], req.sampling_params, req.output_ids
+                )
+            )
+        return token_ids
+
+    # ── Paged-mode metadata builders ────────────────────────────────────
+
+    def _build_slot_mapping(
+        self, requests: list[Request], seq_lens: list[int], page_size: int
+    ) -> torch.Tensor:
+        """Slot indices (in the flat pool view) for each packed prefill token."""
+        slots: list[int] = []
+        for req, s in zip(requests, seq_lens):
+            for tok_pos in range(s):
+                page_idx = req.page_table[tok_pos // page_size]
+                slots.append(page_idx * page_size + (tok_pos % page_size))
+        return torch.tensor(slots, dtype=torch.long, device=self.device)
+
+    def _build_decode_slot_mapping(
+        self, requests: list[Request], page_size: int
+    ) -> torch.Tensor:
+        """Slot indices for the single new token each request appends this step."""
+        slots: list[int] = []
+        for req in requests:
+            new_pos = req.num_kv_tokens - 1
+            page_idx = req.page_table[new_pos // page_size]
+            slots.append(page_idx * page_size + (new_pos % page_size))
+        return torch.tensor(slots, dtype=torch.long, device=self.device)
+
+    def _build_block_table(self, requests: list[Request]) -> torch.Tensor:
+        """(B, max_blocks) int64 page-id table padded with 0 past each row's length."""
+        max_blocks = max(len(r.page_table) for r in requests)
+        bt = torch.zeros(
+            (len(requests), max_blocks), dtype=torch.long, device=self.device
+        )
+        for i, r in enumerate(requests):
+            bt[i, : len(r.page_table)] = torch.tensor(
+                r.page_table, dtype=torch.long, device=self.device
+            )
+        return bt

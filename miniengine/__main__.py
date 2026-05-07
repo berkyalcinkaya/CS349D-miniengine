@@ -46,9 +46,28 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         type=str,
         default="batched",
-        choices=["baseline", "batched"],
-        help="Scheduling mode: baseline (one request at a time) or "
-        "batched (iteration-level batching, milestone 1)",
+        choices=["baseline", "batched", "paged"],
+        help="Scheduling mode: baseline (one request at a time), "
+        "batched (iteration-level batching, milestone 1), or "
+        "paged (paged KV pool + packed prefill, milestone 2)",
+    )
+    p.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        default=0.85,
+        help="Fraction of total GPU memory reserved for static tensors "
+        "(model weights + KV cache pool). Used by --mode paged.",
+    )
+    p.add_argument(
+        "--page-size",
+        type=int,
+        default=32,
+        help="Tokens per page in the KV pool (--mode paged).",
+    )
+    p.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Enable torch.compile on stable sub-regions of the model.",
     )
     return p.parse_args()
 
@@ -72,7 +91,13 @@ def main() -> None:
     )
 
     engine = Engine(
-        model_path=args.model, dtype=dtype, device=args.device, mode=args.mode
+        model_path=args.model,
+        dtype=dtype,
+        device=args.device,
+        mode=args.mode,
+        mem_fraction_static=args.mem_fraction_static,
+        page_size=args.page_size,
+        torch_compile=args.torch_compile,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
 

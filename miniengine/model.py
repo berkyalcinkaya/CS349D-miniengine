@@ -27,6 +27,41 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
+# ── Paged attention metadata ────────────────────────────────────────────
+
+
+@dataclass
+class PagedMeta:
+    """Per-step metadata describing how to read/write the paged KV pool.
+
+    The engine builds one of these per forward; every layer reads from it.
+
+    Attributes:
+        is_prefill:    True for packed-prefill forwards, False for decode.
+        page_size:     Tokens per page in the pool (mirror of pool.page_size).
+        slot_mapping:  (total_tokens,) int64 — the global slot in the
+                       flat (num_pages * page_size) view where each input
+                       token's K/V should be written.  Order matches the
+                       input sequence order.
+        block_table:   (B, max_blocks) int64 — pool page indices per
+                       request, padded with 0 past the request's
+                       num_blocks.
+        cu_seqlens:    Length-(B+1) Python list — cumulative token offsets
+                       in the packed Q for prefill (for slicing q per
+                       request).  For decode, this is range(B+1).
+        cache_seqlens: Length-B Python list — full KV length for each
+                       request *after* the new tokens have been scattered
+                       in this step.
+    """
+
+    is_prefill: bool
+    page_size: int
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    cu_seqlens: list[int]
+    cache_seqlens: list[int]
+
+
 # ── Config ──────────────────────────────────────────────────────────────
 
 
@@ -267,6 +302,152 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.o_proj(out), new_kv
 
+    # ── Paged attention (milestone 2, SDPA gather reference) ───────────
+
+    def forward_paged(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        paged_meta: PagedMeta,
+    ) -> torch.Tensor:
+        """Paged-KV attention.
+
+        Writes new K/V into the pool via `paged_meta.slot_mapping`, then
+        gathers each request's full KV through `paged_meta.block_table`
+        and runs causal (prefill) or non-causal (decode) SDPA.
+
+        Args:
+            hidden:    (1, total_tokens, hidden) for prefill,
+                       (B, 1, hidden) for decode.
+            cos, sin:  RoPE tables matching `hidden`'s layout.
+            k_cache,
+            v_cache:   Pool tensors, shape (num_pages, page_size,
+                       num_kv_heads, head_dim). Mutated in place.
+            paged_meta: see PagedMeta.
+
+        Returns:
+            (bsz, seq_len, hidden_size) attention output.
+        """
+        bsz, seq_len, _ = hidden.shape
+        page_size = paged_meta.page_size
+
+        # Project Q, K, V → (bsz, num_heads, seq_len, head_dim)
+        q = (
+            self.q_proj(hidden)
+            .view(bsz, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(hidden)
+            .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(hidden)
+            .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+
+        # QK-Norm + RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+
+        # Scatter freshly computed K/V into the pool.
+        # k, v: (bsz, num_kv_heads, seq_len, head_dim)
+        # → (bsz * seq_len, num_kv_heads, head_dim) in token-major order.
+        k_flat_in = k.transpose(1, 2).reshape(
+            bsz * seq_len, self.num_kv_heads, self.head_dim
+        )
+        v_flat_in = v.transpose(1, 2).reshape(
+            bsz * seq_len, self.num_kv_heads, self.head_dim
+        )
+        k_cache_flat = k_cache.view(-1, self.num_kv_heads, self.head_dim)
+        v_cache_flat = v_cache.view(-1, self.num_kv_heads, self.head_dim)
+        k_cache_flat[paged_meta.slot_mapping] = k_flat_in
+        v_cache_flat[paged_meta.slot_mapping] = v_flat_in
+
+        # Per-request gather + SDPA. Slow but transparent — step 4 will
+        # replace this with flash-attn paged kernels.
+        outputs: list[torch.Tensor] = []
+        if paged_meta.is_prefill:
+            cu = paged_meta.cu_seqlens
+            for i, cache_len in enumerate(paged_meta.cache_seqlens):
+                qs, qe = cu[i], cu[i + 1]
+                # q is packed along bsz=1: (1, num_heads, total_tokens, head_dim)
+                q_i = q[:, :, qs:qe, :]
+                k_full, v_full = self._gather_paged_kv(
+                    k_cache, v_cache, paged_meta.block_table[i], cache_len, page_size
+                )
+                # Prefill: causal within the request.
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_full, v_full, is_causal=True
+                )
+                outputs.append(out_i)
+            out = torch.cat(outputs, dim=2)  # (1, num_heads, total_tokens, head_dim)
+        else:
+            for i, cache_len in enumerate(paged_meta.cache_seqlens):
+                # q[i]: (1, num_heads, 1, head_dim)
+                q_i = q[i : i + 1]
+                k_full, v_full = self._gather_paged_kv(
+                    k_cache, v_cache, paged_meta.block_table[i], cache_len, page_size
+                )
+                # Decode: q has 1 token attending to full K — no causal mask needed.
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_full, v_full, is_causal=False
+                )
+                outputs.append(out_i)
+            out = torch.cat(outputs, dim=0)  # (B, num_heads, 1, head_dim)
+
+        # Merge heads → project back
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        return self.o_proj(out)
+
+    def _gather_paged_kv(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_ids_row: torch.Tensor,
+        cache_len: int,
+        page_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather a request's full K/V from the pool and shape for SDPA.
+
+        Returns K, V each shaped (1, num_heads, cache_len, head_dim) with
+        GQA expansion already applied so SDPA can be called directly.
+        """
+        num_blocks = (cache_len + page_size - 1) // page_size
+        block_ids = block_ids_row[:num_blocks]
+        # k_cache: (num_pages, page_size, num_kv_heads, head_dim)
+        k_pages = k_cache[block_ids]  # (num_blocks, page_size, num_kv_heads, head_dim)
+        v_pages = v_cache[block_ids]
+        k_full = k_pages.reshape(
+            num_blocks * page_size, self.num_kv_heads, self.head_dim
+        )[:cache_len]
+        v_full = v_pages.reshape(
+            num_blocks * page_size, self.num_kv_heads, self.head_dim
+        )[:cache_len]
+        # → (1, num_kv_heads, cache_len, head_dim)
+        k_full = k_full.transpose(0, 1).unsqueeze(0)
+        v_full = v_full.transpose(0, 1).unsqueeze(0)
+        # GQA: expand kv heads to match num_heads.
+        if self.num_kv_groups > 1:
+            k_full = (
+                k_full[:, :, None, :, :]
+                .expand(-1, -1, self.num_kv_groups, -1, -1)
+                .reshape(1, self.num_heads, -1, self.head_dim)
+            )
+            v_full = (
+                v_full[:, :, None, :, :]
+                .expand(-1, -1, self.num_kv_groups, -1, -1)
+                .reshape(1, self.num_heads, -1, self.head_dim)
+            )
+        return k_full, v_full
+
 
 # ── MLP ─────────────────────────────────────────────────────────────────
 
@@ -325,6 +506,29 @@ class TransformerBlock(nn.Module):
 
         return hidden, new_kv
 
+    def forward_paged(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        paged_meta: PagedMeta,
+    ) -> torch.Tensor:
+        """Paged variant — KV is mutated in-place inside the pool."""
+        residual = hidden
+        hidden = self.input_layernorm(hidden)
+        hidden = self.self_attn.forward_paged(
+            hidden, cos, sin, k_cache, v_cache, paged_meta
+        )
+        hidden = residual + hidden
+
+        residual = hidden
+        hidden = self.post_attention_layernorm(hidden)
+        hidden = self.mlp(hidden)
+        hidden = residual + hidden
+        return hidden
+
 
 # ── Full model ──────────────────────────────────────────────────────────
 
@@ -371,6 +575,26 @@ class TransformerModel(nn.Module):
         hidden = self.norm(hidden)
         return hidden, new_kv_caches
 
+    def forward_paged(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]],
+        paged_meta: PagedMeta,
+    ) -> torch.Tensor:
+        """Paged variant — kv_caches are pool tensors, mutated in place."""
+        hidden = self.embed_tokens(input_ids)
+        cos, sin = self.rotary_emb(position_ids)
+
+        for i, layer in enumerate(self.layers):
+            k_cache, v_cache = kv_caches[i]
+            hidden = layer.forward_paged(
+                hidden, cos, sin, k_cache, v_cache, paged_meta
+            )
+
+        hidden = self.norm(hidden)
+        return hidden
+
 
 class CausalLM(nn.Module):
     """
@@ -406,6 +630,23 @@ class CausalLM(nn.Module):
         else:
             logits = self.lm_head(hidden)
         return logits, new_kv_caches
+
+    def forward_paged(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]],
+        paged_meta: PagedMeta,
+    ) -> torch.Tensor:
+        """Paged variant — returns logits only (KV mutated in pool)."""
+        hidden = self.model.forward_paged(
+            input_ids, position_ids, kv_caches, paged_meta
+        )
+        if self.config.tie_word_embeddings:
+            logits = F.linear(hidden, self.model.embed_tokens.weight)
+        else:
+            logits = self.lm_head(hidden)
+        return logits
 
 
 # ── Weight loading ──────────────────────────────────────────────────────

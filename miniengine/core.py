@@ -54,8 +54,16 @@ class Request:
     status: RequestStatus = RequestStatus.WAITING
     arrival_time: float = field(default_factory=time.time)
 
-    # Per-request KV cache (set by Engine during prefill, updated on each decode)
+    # Per-request KV cache (set by Engine during prefill, updated on each decode).
+    # Used by baseline / batched modes only. Paged mode leaves this as None and
+    # uses page_table + num_kv_tokens below to index into the shared KV pool.
     kv_cache: Any = None
+
+    # Paged-mode KV state (milestone 2). page_table is the ordered list of
+    # KV-pool page indices owned by this request; num_kv_tokens is the logical
+    # KV length so far (used to derive the next slot within the last page).
+    page_table: list[int] = field(default_factory=list)
+    num_kv_tokens: int = 0
 
     # Streaming output channel — scheduler pushes, server consumes
     token_queue: queue.Queue = field(default_factory=queue.Queue)
