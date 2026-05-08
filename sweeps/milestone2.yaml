@@ -1,0 +1,70 @@
+sweep_id: m2-report
+model: Qwen/Qwen3-8B
+port: 8000
+
+# Server warmup is generous because torch.compile + cuda-graph capture takes time.
+server_warmup_timeout_s: 900
+bench_timeout_s: 7200
+max_attempts_per_item: 2
+
+defaults:
+  server:
+    mem_fraction_static: 0.85
+    page_size: 32
+
+# Items are run in order. Consecutive items with identical `server` configs
+# reuse the same server process, paying warmup only once.
+items:
+  # Accuracy: paged
+  - id: acc-paged
+    server: { mode: paged }
+    bench:
+      script: bench_accuracy
+      dataset: mmlu
+      num_samples: 200
+
+  # Accuracy: paged + torch.compile  (NEW server config, restart)
+  - id: acc-paged-compile
+    server: { mode: paged, torch_compile: true }
+    bench:
+      script: bench_accuracy
+      dataset: mmlu
+      num_samples: 200
+
+  # Throughput: paged + torch.compile, sweep concurrency. Same server config
+  # as acc-paged-compile, so the runner reuses the warmed-up server.
+  # The loader expands `concurrencies: [...]` into one item per level for
+  # fault isolation.
+  - id: thru-paged-compile
+    server: { mode: paged, torch_compile: true }
+    bench:
+      script: bench_serving
+      input_len: 1024
+      output_len: 512
+      concurrencies: [1, 2, 4, 8, 16, 32]
+
+  # Throughput: milestone-1 batched baseline (different server, restart).
+  - id: thru-batched
+    server: { mode: batched }
+    bench:
+      script: bench_serving
+      input_len: 1024
+      output_len: 512
+      concurrencies: [1, 2, 4, 8, 16, 32]
+
+  # Page-size comparison at concurrency=16. Each is its own server config.
+  - id: page-size-16
+    server: { mode: paged, torch_compile: true, page_size: 16 }
+    bench:
+      script: bench_serving
+      input_len: 1024
+      output_len: 512
+      concurrencies: [16]
+
+  - id: page-size-128
+    server: { mode: paged, torch_compile: true, page_size: 128 }
+    bench:
+      script: bench_serving
+      input_len: 1024
+      output_len: 512
+      concurrencies: [16]
