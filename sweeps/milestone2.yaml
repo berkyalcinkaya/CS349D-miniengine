@@ -53,16 +53,24 @@ items:
       concurrencies: [1, 2, 4, 8, 16, 32]
 
   # Page-size comparison at concurrency=16. Each is its own server config.
-  - id: page-size-16
-    server: { mode: paged, torch_compile: true, page_size: 16 }
+  - id: page-size-256
+    server: { mode: paged, torch_compile: true, page_size: 256 }
     bench:
       script: bench_serving
       input_len: 1024
       output_len: 512
       concurrencies: [16]
 
-  - id: page-size-128
-    server: { mode: paged, torch_compile: true, page_size: 128 }
+  - id: page-size-512
+    server: { mode: paged, torch_compile: true, page_size: 512 }
+    bench:
+      script: bench_serving
+      input_len: 1024
+      output_len: 512
+      concurrencies: [16]
+  
+  - id: page-size-1024
+    server: { mode: paged, torch_compile: true, page_size: 1024 }
     bench:
       script: bench_serving
       input_len: 1024
