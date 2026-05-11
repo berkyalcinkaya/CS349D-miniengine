@@ -45,21 +45,25 @@ class Item:
             json.dumps(self.server, sort_keys=True).encode()
         ).hexdigest()[:12]
 
-    def server_cli(self, model: str, port: int) -> list[str]:
-        base = ["python3", "-m", "miniengine", "--model", model, "--port", str(port)]
-        return base + dict_to_cli(self.server)
+    def server_cli(
+        self, model: str, port: int, override_cmd: list[str] | None = None
+    ) -> list[str]:
+        base = list(override_cmd) if override_cmd is not None else ["python3", "-m", "miniengine"]
+        return base + ["--model", model, "--port", str(port)] + dict_to_cli(self.server)
 
-    def bench_cli(self, model: str, port: int) -> list[str]:
+    def bench_cli(
+        self, model: str, port: int, override_cmd: list[str] | None = None
+    ) -> list[str]:
         bench = dict(self.bench)
         script = bench.pop("script")
-        if script not in ("bench_serving", "bench_accuracy"):
-            raise ValueError(f"unknown bench script: {script!r}")
-        base = [
-            "python3", "-m", f"benchmark.{script}",
+        if override_cmd is not None:
+            base = list(override_cmd)
+        else:
+            base = ["python3", "-m", f"benchmark.{script}"]
+        return base + [
             "--model", model,
             "--base-url", f"http://localhost:{port}",
-        ]
-        return base + dict_to_cli(bench)
+        ] + dict_to_cli(bench)
 
 
 @dataclass

@@ -116,6 +116,25 @@ invocation the runner skips items already `done` and retries others up to
    restarts the VM and re-invokes the runner. Status files make resume
    automatic.
 
+## Testing
+
+End-to-end preemption test (no GCP needed, ~15s):
+
+```bash
+python -m tests.test_preemption
+```
+
+Spawns the runner with fake server/bench/metadata-server, flips the
+preemption flag mid-sweep, and asserts that:
+
+- the runner exits 75,
+- the in-flight item is marked `interrupted`,
+- a second invocation resumes and completes the remaining items.
+
+The runner takes `--server-cmd`, `--bench-cmd`, `--preempt-url`, and
+`--preempt-poll-s` flags to make this swap-in possible — they're also useful
+in production if you want to point at a different inference server.
+
 ## Known gaps
 
 - `bench_serving` / `bench_accuracy` don't emit a structured result file;

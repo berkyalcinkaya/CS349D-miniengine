@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fault_tolerance.preempt import PreemptWatcher
+from fault_tolerance.preempt import METADATA_URL, PreemptWatcher
 from fault_tolerance.server_proc import ServerProcess, ServerStartError
 from fault_tolerance.sweep import Item, Sweep, load_sweep
 
@@ -43,8 +44,13 @@ def _write_status(item_dir: Path, **fields) -> dict:
     return status
 
 
-def _run_bench(item: Item, sweep: Sweep, item_dir: Path) -> tuple[int, str | None]:
-    argv = item.bench_cli(sweep.model, sweep.port)
+def _run_bench(
+    item: Item,
+    sweep: Sweep,
+    item_dir: Path,
+    bench_cmd: list[str] | None,
+) -> tuple[int, str | None]:
+    argv = item.bench_cli(sweep.model, sweep.port, override_cmd=bench_cmd)
     bench_log = item_dir / "bench.stdout"
     item_dir.mkdir(parents=True, exist_ok=True)
     with bench_log.open("ab", buffering=0) as fh:
@@ -61,7 +67,14 @@ def _run_bench(item: Item, sweep: Sweep, item_dir: Path) -> tuple[int, str | Non
     return proc.returncode, None
 
 
-def run_sweep(sweep_path: Path, state_root: Path) -> int:
+def run_sweep(
+    sweep_path: Path,
+    state_root: Path,
+    server_cmd: list[str] | None = None,
+    bench_cmd: list[str] | None = None,
+    preempt_url: str = METADATA_URL,
+    preempt_poll_s: float = 5.0,
+) -> int:
     sweep = load_sweep(sweep_path)
     state_dir = state_root / sweep.sweep_id
     items_dir = state_dir / "items"
@@ -72,7 +85,7 @@ def run_sweep(sweep_path: Path, state_root: Path) -> int:
     print(f"[runner] sweep={sweep.sweep_id} items={len(sweep.items)} "
           f"state_dir={state_dir}", flush=True)
 
-    preempt = PreemptWatcher().start()
+    preempt = PreemptWatcher(poll_interval_s=preempt_poll_s, url=preempt_url).start()
     server: ServerProcess | None = None
     current_fp: str | None = None
 
@@ -103,7 +116,7 @@ def run_sweep(sweep_path: Path, state_root: Path) -> int:
             fp = item.server_fingerprint()
             if fp != current_fp:
                 kill_server()
-                argv = item.server_cli(sweep.model, sweep.port)
+                argv = item.server_cli(sweep.model, sweep.port, override_cmd=server_cmd)
                 print(f"[runner] {item.id}: starting server fp={fp}", flush=True)
                 print(f"[runner]   $ {' '.join(argv)}", flush=True)
                 server = ServerProcess(
@@ -139,7 +152,7 @@ def run_sweep(sweep_path: Path, state_root: Path) -> int:
             )
             print(f"[runner] {item.id}: running bench (attempt {attempt})", flush=True)
             t0 = time.monotonic()
-            rc, err = _run_bench(item, sweep, item_dir)
+            rc, err = _run_bench(item, sweep, item_dir, bench_cmd=bench_cmd)
             elapsed = time.monotonic() - t0
 
             if rc == 0:
@@ -194,8 +207,26 @@ def main() -> int:
     p.add_argument("--sweep", required=True, type=Path)
     p.add_argument("--state-dir", required=True, type=Path,
                    help="Directory holding per-sweep state (resumable).")
+    p.add_argument("--server-cmd", type=str, default=None,
+                   help="Override the server command prefix (default: 'python3 -m miniengine'). "
+                        "Useful for tests or pointing at a different inference server.")
+    p.add_argument("--bench-cmd", type=str, default=None,
+                   help="Override the bench command prefix (default: "
+                        "'python3 -m benchmark.<script>'). Replaces the entire prefix "
+                        "including the script name.")
+    p.add_argument("--preempt-url", type=str, default=METADATA_URL,
+                   help="URL for the spot-preemption signal (default: GCE metadata).")
+    p.add_argument("--preempt-poll-s", type=float, default=5.0,
+                   help="How often to poll the preempt URL.")
     args = p.parse_args()
-    return run_sweep(args.sweep, args.state_dir)
+    return run_sweep(
+        sweep_path=args.sweep,
+        state_root=args.state_dir,
+        server_cmd=shlex.split(args.server_cmd) if args.server_cmd else None,
+        bench_cmd=shlex.split(args.bench_cmd) if args.bench_cmd else None,
+        preempt_url=args.preempt_url,
+        preempt_poll_s=args.preempt_poll_s,
+    )
 
 
 if __name__ == "__main__":
