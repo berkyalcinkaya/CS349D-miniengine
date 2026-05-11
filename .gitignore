@@ -59,5 +59,7 @@ Thumbs.db
 *.gguf
  
 logs/
+*.log
+.claude/worktrees/
 
 milestones/milestone2-claude.md
