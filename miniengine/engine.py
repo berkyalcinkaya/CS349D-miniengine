@@ -110,6 +110,37 @@ class Engine:
         if mode == "paged":
             self._init_kv_pool(config)
 
+        # ── torch.compile (Part C) ─────────────────────────────────────
+        if torch_compile:
+            self._apply_torch_compile()
+
+    # ── torch.compile ───────────────────────────────────────────────────
+
+    def _apply_torch_compile(self) -> None:
+        """Compile per-layer MLPs.
+
+        We target only the MLP sub-region. The attention path takes
+        per-step paged metadata whose tensor shapes vary (B, total_tokens,
+        cache_seqlens), which would trigger dynamo recompiles or
+        graph-break fallbacks. The MLP is pure linear + SiLU + multiply on
+        a (B, S, hidden) input — same op sequence in every forward.
+
+        `dynamic=True` lets a single compiled graph handle the varying
+        leading dim (total_tokens during prefill, B during decode) without
+        recompiling per shape.
+        """
+        if not self.device.startswith("cuda"):
+            logger.warning("--torch-compile requires CUDA; skipping")
+            return
+
+        layers = self.model.model.layers
+        for layer in layers:
+            layer.mlp = torch.compile(layer.mlp, mode="default", dynamic=True)
+        logger.info(
+            "torch.compile applied to %d MLP modules (mode=default, dynamic=True)",
+            len(layers),
+        )
+
     # ── Paged KV pool init ──────────────────────────────────────────────
 
     def _init_kv_pool(self, config: ModelConfig) -> None:
@@ -380,6 +411,14 @@ class Engine:
         # block_table padded to max blocks across the batch.
         block_table = self._build_block_table(requests)
 
+        # GPU tensors required by flash-attn (varlen / with_kvcache).
+        cu_seqlens_tensor = torch.tensor(
+            cu_seqlens, dtype=torch.int32, device=self.device
+        )
+        cache_seqlens_tensor = torch.tensor(
+            seq_lens, dtype=torch.int32, device=self.device
+        )
+
         paged_meta = PagedMeta(
             is_prefill=True,
             page_size=page_size,
@@ -387,6 +426,9 @@ class Engine:
             block_table=block_table,
             cu_seqlens=cu_seqlens,
             cache_seqlens=list(seq_lens),
+            cu_seqlens_tensor=cu_seqlens_tensor,
+            cache_seqlens_tensor=cache_seqlens_tensor,
+            max_seqlen=max(seq_lens),
         )
 
         logits = self.model.forward_paged(
@@ -442,13 +484,25 @@ class Engine:
         slot_mapping = self._build_decode_slot_mapping(requests, page_size)
         block_table = self._build_block_table(requests)
 
+        cache_seqlens_list = [r.num_kv_tokens for r in requests]
+        cu_seqlens_list = list(range(bsz + 1))
+        cu_seqlens_tensor = torch.tensor(
+            cu_seqlens_list, dtype=torch.int32, device=self.device
+        )
+        cache_seqlens_tensor = torch.tensor(
+            cache_seqlens_list, dtype=torch.int32, device=self.device
+        )
+
         paged_meta = PagedMeta(
             is_prefill=False,
             page_size=page_size,
             slot_mapping=slot_mapping,
             block_table=block_table,
-            cu_seqlens=list(range(bsz + 1)),
-            cache_seqlens=[r.num_kv_tokens for r in requests],
+            cu_seqlens=cu_seqlens_list,
+            cache_seqlens=cache_seqlens_list,
+            cu_seqlens_tensor=cu_seqlens_tensor,
+            cache_seqlens_tensor=cache_seqlens_tensor,
+            max_seqlen=max(cache_seqlens_list) if cache_seqlens_list else 0,
         )
 
         logits = self.model.forward_paged(
@@ -489,13 +543,17 @@ class Engine:
         return torch.tensor(slots, dtype=torch.long, device=self.device)
 
     def _build_block_table(self, requests: list[Request]) -> torch.Tensor:
-        """(B, max_blocks) int64 page-id table padded with 0 past each row's length."""
+        """(B, max_blocks) int32 page-id table padded with 0 past each row's length.
+
+        int32 is the layout flash-attn expects.  The SDPA gather path
+        casts to long internally for fancy indexing.
+        """
         max_blocks = max(len(r.page_table) for r in requests)
         bt = torch.zeros(
-            (len(requests), max_blocks), dtype=torch.long, device=self.device
+            (len(requests), max_blocks), dtype=torch.int32, device=self.device
         )
         for i, r in enumerate(requests):
             bt[i, : len(r.page_table)] = torch.tensor(
-                r.page_table, dtype=torch.long, device=self.device
+                r.page_table, dtype=torch.int32, device=self.device
             )
         return bt

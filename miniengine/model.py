@@ -27,6 +27,18 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
+# ── Flash-attn (optional; falls back to SDPA gather if unavailable) ─────
+
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache  # type: ignore
+
+    _HAS_FLASH_ATTN = True
+except Exception:  # noqa: BLE001 — broad: import may fail in many ways
+    flash_attn_varlen_func = None  # type: ignore[assignment]
+    flash_attn_with_kvcache = None  # type: ignore[assignment]
+    _HAS_FLASH_ATTN = False
+
+
 # ── Paged attention metadata ────────────────────────────────────────────
 
 
@@ -35,23 +47,28 @@ class PagedMeta:
     """Per-step metadata describing how to read/write the paged KV pool.
 
     The engine builds one of these per forward; every layer reads from it.
+    Both the SDPA-gather and flash-attn paths consume the same struct —
+    Python-list fields drive the SDPA per-request loop, tensor fields
+    drive the flash-attn calls.
 
     Attributes:
         is_prefill:    True for packed-prefill forwards, False for decode.
         page_size:     Tokens per page in the pool (mirror of pool.page_size).
-        slot_mapping:  (total_tokens,) int64 — the global slot in the
-                       flat (num_pages * page_size) view where each input
-                       token's K/V should be written.  Order matches the
-                       input sequence order.
-        block_table:   (B, max_blocks) int64 — pool page indices per
-                       request, padded with 0 past the request's
-                       num_blocks.
-        cu_seqlens:    Length-(B+1) Python list — cumulative token offsets
-                       in the packed Q for prefill (for slicing q per
-                       request).  For decode, this is range(B+1).
-        cache_seqlens: Length-B Python list — full KV length for each
-                       request *after* the new tokens have been scattered
-                       in this step.
+        slot_mapping:  (total_tokens,) int64 — global slot in the flat
+                       (num_pages * page_size) view where each input token's
+                       K/V should be written. Order matches input order.
+        block_table:   (B, max_blocks) int32 — pool page indices per request,
+                       padded with 0 past the request's num_blocks.
+                       (int32 because flash-attn requires it; SDPA path
+                       casts to long for fancy indexing.)
+        cu_seqlens:    (B+1,) Python list — cumulative token offsets in the
+                       packed Q for prefill.  For decode, this is range(B+1).
+        cache_seqlens: (B,) Python list — full KV length per request *after*
+                       the new tokens have been scattered in this step.
+        cu_seqlens_tensor:    (B+1,) int32 on device — flash-attn varlen.
+        cache_seqlens_tensor: (B,)   int32 on device — flash-attn with_kvcache.
+        max_seqlen:    Longest per-request seq length this step (Python int);
+                       required by flash_attn_varlen_func.
     """
 
     is_prefill: bool
@@ -60,6 +77,9 @@ class PagedMeta:
     block_table: torch.Tensor
     cu_seqlens: list[int]
     cache_seqlens: list[int]
+    cu_seqlens_tensor: torch.Tensor
+    cache_seqlens_tensor: torch.Tensor
+    max_seqlen: int
 
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -302,7 +322,7 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.o_proj(out), new_kv
 
-    # ── Paged attention (milestone 2, SDPA gather reference) ───────────
+    # ── Paged attention (milestone 2) ───────────────────────────────────
 
     def forward_paged(
         self,
@@ -315,9 +335,15 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         """Paged-KV attention.
 
-        Writes new K/V into the pool via `paged_meta.slot_mapping`, then
-        gathers each request's full KV through `paged_meta.block_table`
-        and runs causal (prefill) or non-causal (decode) SDPA.
+        Projects Q/K/V, applies QK-Norm + RoPE, scatters new K/V into the
+        pool via `paged_meta.slot_mapping`, then dispatches to one of two
+        attention backends:
+
+          - flash-attn (`flash_attn_varlen_func` for prefill,
+            `flash_attn_with_kvcache` for decode) when available + CUDA +
+            half precision.
+          - SDPA gather (per-request loop) as a fallback for CPU / fp32 /
+            no-flash environments.
 
         Args:
             hidden:    (1, total_tokens, hidden) for prefill,
@@ -332,7 +358,6 @@ class Attention(nn.Module):
             (bsz, seq_len, hidden_size) attention output.
         """
         bsz, seq_len, _ = hidden.shape
-        page_size = paged_meta.page_size
 
         # Project Q, K, V → (bsz, num_heads, seq_len, head_dim)
         q = (
@@ -357,9 +382,12 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # Scatter freshly computed K/V into the pool.
+        # Scatter freshly computed K/V into the pool. flash-attn's decode
+        # path could write the new K/V itself, but we always scatter here
+        # so prefill and decode share one code path and so the pool
+        # always reflects the post-write state.
         # k, v: (bsz, num_kv_heads, seq_len, head_dim)
-        # → (bsz * seq_len, num_kv_heads, head_dim) in token-major order.
+        # → (bsz * seq_len, num_kv_heads, head_dim) token-major.
         k_flat_in = k.transpose(1, 2).reshape(
             bsz * seq_len, self.num_kv_heads, self.head_dim
         )
@@ -371,41 +399,127 @@ class Attention(nn.Module):
         k_cache_flat[paged_meta.slot_mapping] = k_flat_in
         v_cache_flat[paged_meta.slot_mapping] = v_flat_in
 
-        # Per-request gather + SDPA. Slow but transparent — step 4 will
-        # replace this with flash-attn paged kernels.
+        # Dispatch.
+        use_flash = (
+            _HAS_FLASH_ATTN
+            and hidden.is_cuda
+            and hidden.dtype in (torch.float16, torch.bfloat16)
+        )
+        if use_flash:
+            if paged_meta.is_prefill:
+                out = self._attn_flash_prefill(q, k, v, paged_meta)
+            else:
+                out = self._attn_flash_decode(q, k_cache, v_cache, paged_meta)
+        else:
+            out = self._attn_sdpa_gather(q, k_cache, v_cache, paged_meta)
+
+        # `out` shape: (bsz, seq_len, hidden_size) — ready for o_proj.
+        return self.o_proj(out)
+
+    # ── Flash-attn paths ────────────────────────────────────────────────
+
+    def _attn_flash_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        paged_meta: PagedMeta,
+    ) -> torch.Tensor:
+        """Packed varlen attention on the freshly computed Q/K/V.
+
+        Reads K/V directly from the just-projected tensors rather than
+        gathering through the pool — saves a redundant gather since the
+        prefill writes and reads the same K/V.
+        """
+        # q: (1, num_heads, total, head_dim) → (total, num_heads, head_dim)
+        q_flash = q.transpose(1, 2).squeeze(0).contiguous()
+        k_flash = k.transpose(1, 2).squeeze(0).contiguous()
+        v_flash = v.transpose(1, 2).squeeze(0).contiguous()
+
+        out = flash_attn_varlen_func(  # type: ignore[misc]
+            q_flash,
+            k_flash,
+            v_flash,
+            cu_seqlens_q=paged_meta.cu_seqlens_tensor,
+            cu_seqlens_k=paged_meta.cu_seqlens_tensor,
+            max_seqlen_q=paged_meta.max_seqlen,
+            max_seqlen_k=paged_meta.max_seqlen,
+            causal=True,
+        )
+        # out: (total, num_heads, head_dim) → (1, total, hidden_size)
+        return out.reshape(1, -1, self.num_heads * self.head_dim)
+
+    def _attn_flash_decode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        paged_meta: PagedMeta,
+    ) -> torch.Tensor:
+        """Paged-KV attention for decode (seqlen_q = 1).
+
+        The new K/V have already been scattered into the pool, so we
+        pass `k=None, v=None` and rely on `block_table` + `cache_seqlens`
+        to read the full per-request KV.
+        """
+        # q: (B, num_heads, 1, head_dim) → (B, 1, num_heads, head_dim)
+        q_flash = q.transpose(1, 2).contiguous()
+        bsz = q_flash.shape[0]
+
+        out = flash_attn_with_kvcache(  # type: ignore[misc]
+            q_flash,
+            k_cache,
+            v_cache,
+            k=None,
+            v=None,
+            cache_seqlens=paged_meta.cache_seqlens_tensor,
+            block_table=paged_meta.block_table,
+            causal=False,
+        )
+        # out: (B, 1, num_heads, head_dim) → (B, 1, hidden_size)
+        return out.reshape(bsz, 1, self.num_heads * self.head_dim)
+
+    # ── SDPA gather path (fallback / reference) ─────────────────────────
+
+    def _attn_sdpa_gather(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        paged_meta: PagedMeta,
+    ) -> torch.Tensor:
+        """Per-request gather + SDPA. Correct but slow."""
+        bsz, _, seq_len, _ = q.shape
+        page_size = paged_meta.page_size
         outputs: list[torch.Tensor] = []
+
         if paged_meta.is_prefill:
             cu = paged_meta.cu_seqlens
             for i, cache_len in enumerate(paged_meta.cache_seqlens):
                 qs, qe = cu[i], cu[i + 1]
-                # q is packed along bsz=1: (1, num_heads, total_tokens, head_dim)
                 q_i = q[:, :, qs:qe, :]
                 k_full, v_full = self._gather_paged_kv(
                     k_cache, v_cache, paged_meta.block_table[i], cache_len, page_size
                 )
-                # Prefill: causal within the request.
                 out_i = F.scaled_dot_product_attention(
                     q_i, k_full, v_full, is_causal=True
                 )
                 outputs.append(out_i)
-            out = torch.cat(outputs, dim=2)  # (1, num_heads, total_tokens, head_dim)
+            out = torch.cat(outputs, dim=2)
         else:
             for i, cache_len in enumerate(paged_meta.cache_seqlens):
-                # q[i]: (1, num_heads, 1, head_dim)
                 q_i = q[i : i + 1]
                 k_full, v_full = self._gather_paged_kv(
                     k_cache, v_cache, paged_meta.block_table[i], cache_len, page_size
                 )
-                # Decode: q has 1 token attending to full K — no causal mask needed.
                 out_i = F.scaled_dot_product_attention(
                     q_i, k_full, v_full, is_causal=False
                 )
                 outputs.append(out_i)
-            out = torch.cat(outputs, dim=0)  # (B, num_heads, 1, head_dim)
+            out = torch.cat(outputs, dim=0)
 
-        # Merge heads → project back
-        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        return self.o_proj(out)
+        # (bsz, num_heads, seq_len, head_dim) → (bsz, seq_len, hidden_size)
+        return out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
 
     def _gather_paged_kv(
         self,
@@ -421,8 +535,9 @@ class Attention(nn.Module):
         GQA expansion already applied so SDPA can be called directly.
         """
         num_blocks = (cache_len + page_size - 1) // page_size
-        block_ids = block_ids_row[:num_blocks]
-        # k_cache: (num_pages, page_size, num_kv_heads, head_dim)
+        # block_table is int32 (flash-attn convention); fancy indexing
+        # into k_cache needs int64.
+        block_ids = block_ids_row[:num_blocks].long()
         k_pages = k_cache[block_ids]  # (num_blocks, page_size, num_kv_heads, head_dim)
         v_pages = v_cache[block_ids]
         k_full = k_pages.reshape(
@@ -434,7 +549,6 @@ class Attention(nn.Module):
         # → (1, num_kv_heads, cache_len, head_dim)
         k_full = k_full.transpose(0, 1).unsqueeze(0)
         v_full = v_full.transpose(0, 1).unsqueeze(0)
-        # GQA: expand kv heads to match num_heads.
         if self.num_kv_groups > 1:
             k_full = (
                 k_full[:, :, None, :, :]
