@@ -23,6 +23,9 @@ bench = [
     "numpy",
     "tqdm",
 ]
+fault-tolerance = [
+    "pyyaml",
+]
 
 [project.scripts]
 miniengine = "miniengine.__main__:main"
