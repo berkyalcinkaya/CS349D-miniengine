@@ -21,6 +21,7 @@ stays mode-agnostic.
 
 from __future__ import annotations
 
+import gc
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -137,6 +138,15 @@ class Engine:
             self.model = CausalLM(config)
         load_weights(self.model, model_path, dtype=dtype, device=device)
         self.model.eval()
+
+        # The safetensors load path leaves dtype-cast temporaries cached by
+        # the allocator as *reserved* memory.  Release them before the KV
+        # pool sizes itself off torch.cuda.mem_get_info(), otherwise ``free``
+        # reads artificially low and the pool budget collapses to its floor.
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
         # ── Stop tokens ─────────────────────────────────────────────────
         self.stop_token_ids: set[int] = set()
