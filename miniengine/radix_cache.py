@@ -143,8 +143,11 @@ class RadixCache:
         now = time.monotonic()
 
         while idx < n:
-            first = tokens[idx]
-            child = node.children.get(first)
+            if n - idx < ps:
+                break  # not a full page left → page-granular matching stops
+            # Children are keyed by their first *page* (not first token), so a
+            # found child is guaranteed to share that whole page.
+            child = node.children.get(tuple(tokens[idx : idx + ps]))
             if child is None:
                 break
             # Compare the edge against the query, page by page.
@@ -215,15 +218,16 @@ class RadixCache:
 
         while idx < n:
             node.last_access = now
-            first = tokens[idx]
-            child = node.children.get(first)
+            # Insert keys are page-aligned, so a full page is always available.
+            ckey = tuple(tokens[idx : idx + ps])
+            child = node.children.get(ckey)
             if child is None:
                 # No matching edge — attach the rest as a fresh child.
                 new = RadixNode()
                 new.parent = node
                 new.key = tokens[idx:]
                 new.pages = pages[pidx:]
-                node.children[first] = new
+                node.children[ckey] = new
                 self._cached_pages += len(new.pages)
                 self.metrics.total_inserted_pages += len(new.pages)
                 new.last_access = now
@@ -267,8 +271,10 @@ class RadixCache:
         head.pages = node.pages[:n_pages]
         head.ref_count = node.ref_count
         head.last_access = node.last_access
-        head.children = {node.key[n_tokens]: node}
-        parent.children[head.key[0]] = head
+        # Children keyed by first page.  ``head`` shares ``node``'s first page,
+        # so this overwrites ``node``'s old slot under ``parent``.
+        head.children = {tuple(node.key[n_tokens : n_tokens + ps]): node}
+        parent.children[tuple(head.key[:ps])] = head
 
         node.parent = head
         node.key = node.key[n_tokens:]
@@ -304,7 +310,7 @@ class RadixCache:
             freed += len(leaf.pages)
             self._cached_pages -= len(leaf.pages)
             self.metrics.total_evicted_pages += len(leaf.pages)
-            del parent.children[leaf.key[0]]
+            del parent.children[tuple(leaf.key[: self.page_size])]
             leaf.parent = None
             # Parent may now be an evictable leaf — reconsider it.
             if parent is not self.root and not parent.children and parent.ref_count == 0:

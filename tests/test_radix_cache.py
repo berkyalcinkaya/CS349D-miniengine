@@ -180,6 +180,22 @@ def test_locked_node_survives_split_and_unlocks_cleanly():
     assert cache.num_cached_pages == 0
 
 
+def test_first_token_collision_distinct_first_page():
+    # Two sequences share the FIRST TOKEN but diverge inside the first page.
+    # With page-granular matching they must become distinct children (no
+    # shared page), not trigger a zero-length split.  This reproduces the
+    # IndexError seen on the MMLU workload.
+    pool, cache = make_cache(page_size=2)
+    a, _ = cache.insert_and_return(seq(1, 2, 3, 4), pool.allocate(2))
+    # Same first token (1) but second token differs → different first page.
+    b, redundant = cache.insert_and_return(seq(1, 9, 5, 6), pool.allocate(2))
+    assert redundant == []  # nothing shared, nothing redundant
+    assert cache.match_prefix(seq(1, 2, 3, 4)).matched_tokens == 4
+    assert cache.match_prefix(seq(1, 9, 5, 6)).matched_tokens == 4
+    # A prompt sharing only the first token with both still matches neither.
+    assert cache.match_prefix(seq(1, 7, 0, 0)).matched_tokens == 0
+
+
 def test_reset_returns_all_pages():
     pool, cache = make_cache(page_size=2)
     cache.insert_and_return(seq(1, 2, 3, 4), pool.allocate(2))
