@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Any
 
 import torch
 
@@ -89,6 +90,12 @@ class KVMemoryPool:
         # Free list: every page except the reserved scratch page.
         self._free: list[int] = list(range(1, num_pages))
 
+        # Optional radix prefix cache (Milestone 3, Part B).  Pages held by
+        # the cache are *not* in ``self._free``; when the free list runs
+        # short ``allocate`` asks the cache to evict LRU pages before it
+        # raises OOM.  Stays ``None`` when the cache is disabled.
+        self.radix_cache: Any = None
+
         elem = torch.tensor([], dtype=dtype).element_size()
         bytes_total = (
             2 * num_layers * num_pages * page_size * num_kv_heads * head_dim * elem
@@ -112,6 +119,11 @@ class KVMemoryPool:
             raise ValueError(f"num_pages must be non-negative, got {num_pages}")
         if num_pages == 0:
             return []
+        # Eviction-on-allocate: pages held by the radix cache aren't free,
+        # but unlocked ones can be reclaimed.  Ask the cache to give back
+        # the shortfall before declaring the pool exhausted.
+        if len(self._free) < num_pages and self.radix_cache is not None:
+            self.radix_cache.evict(num_pages - len(self._free))
         if len(self._free) < num_pages:
             raise RuntimeError(
                 f"KV pool exhausted: requested {num_pages}, "
@@ -139,6 +151,22 @@ class KVMemoryPool:
     def num_free(self) -> int:
         """Pages currently available for allocation (excludes scratch)."""
         return len(self._free)
+
+    @property
+    def num_evictable(self) -> int:
+        """Cache-held pages an LRU sweep could reclaim right now."""
+        if self.radix_cache is None:
+            return 0
+        return self.radix_cache.num_evictable_pages()
+
+    @property
+    def available_pages(self) -> int:
+        """Pages obtainable without OOM = free + evictable-from-cache.
+
+        Admission uses this so cache-held (but unlocked) pages don't make
+        the scheduler stall — ``allocate`` will evict them on demand.
+        """
+        return self.num_free + self.num_evictable
 
     @property
     def kv_caches(self) -> list[tuple[torch.Tensor, torch.Tensor]]:

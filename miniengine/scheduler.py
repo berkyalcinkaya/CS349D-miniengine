@@ -194,16 +194,23 @@ class Scheduler:
         assert pool is not None, "scheduler in paged mode but engine has no KV pool"
 
         # ── Phase 1: admit + batched paged prefill ──────────────────────
+        # Admission budget = free + cache-evictable pages (allocate() reclaims
+        # LRU cache pages on demand).  We charge each admitted request its
+        # full prompt's page count — an upper bound, since a radix-cache hit
+        # reuses some pages and the real allocation will be smaller.
         with self._lock:
             to_prefill: list[Request] = []
+            budget = pool.available_pages
             while (
                 self.waiting
                 and len(self.running) + len(to_prefill) < self.max_running
             ):
                 req = self.waiting[0]
-                if pool.num_free < pool.pages_needed(len(req.input_ids)):
+                need = pool.pages_needed(len(req.input_ids))
+                if need > budget:
                     break  # can't fit; wait for pages to free
                 to_prefill.append(self.waiting.popleft())
+                budget -= need
 
         if to_prefill:
             for req in to_prefill:
@@ -217,6 +224,7 @@ class Scheduler:
                     self._finish_request(req, finished)
                 else:
                     self.running.append(req)
+            self._log_prefill_batch(to_prefill)
 
         # ── Phase 2: paged batched decode ───────────────────────────────
         if self.running:
@@ -234,6 +242,25 @@ class Scheduler:
         return finished
 
     # ── Helpers ─────────────────────────────────────────────────────────
+
+    def _log_prefill_batch(self, batch: list[Request]) -> None:
+        """Per-prefill-batch INFO line surfacing radix-cache effectiveness."""
+        cache = getattr(self.engine, "radix_cache", None)
+        if cache is None:
+            return
+        hit = sum(r.cache_hit_tokens for r in batch)
+        prompt = sum(r.num_input_tokens for r in batch)
+        logger.info(
+            "Prefilled %d req(s): %d/%d prompt tokens from cache (%.0f%% batch, "
+            "%.0f%% lifetime), %d cached pages, %d free",
+            len(batch),
+            hit,
+            prompt,
+            100 * hit / max(1, prompt),
+            100 * cache.metrics.hit_rate,
+            cache.num_cached_pages,
+            self.engine.pool.num_free if self.engine.pool else 0,
+        )
 
     def _check_finished(self, req: Request, token_id: int) -> bool:
         """Decide whether a request should stop generating."""

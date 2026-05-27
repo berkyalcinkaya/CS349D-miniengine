@@ -22,6 +22,7 @@ stays mode-agnostic.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,6 +33,7 @@ from transformers import AutoTokenizer
 from miniengine.core import Request
 from miniengine.kv_memory_pool import KVMemoryPool
 from miniengine.model import CausalLM, FlashInferContext, ModelConfig, load_weights
+from miniengine.radix_cache import RadixCache
 from miniengine.sampler import sample_token
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,16 @@ class _PagedState:
 
     page_table: list[int] = field(default_factory=list)
     cache_seq_len: int = 0
+    # ── Milestone 3 ────────────────────────────────────────────────────
+    # Prefill progress: tokens whose KV is already in the pool.  Starts at
+    # ``prefix_len`` (radix-cache hit) and walks up to the prompt length as
+    # chunked prefill proceeds.
+    prefill_pos: int = 0
+    # Tokens served from the radix cache (page-aligned); their pages are the
+    # leading entries of ``page_table`` and are borrowed (read-only).
+    prefix_len: int = 0
+    # The cache node locked for the borrowed prefix; released at finish.
+    prefix_node: Any = None
 
 
 class Engine:
@@ -82,6 +94,9 @@ class Engine:
         cuda_graph_max_pages: int = 32,
         attention_backend: str = "flashinfer",
         flashinfer_workspace_mb: int = 128,
+        # ── Milestone 3 ────────────────────────────────────────────────
+        prefill_chunk_size: int = 0,
+        disable_radix_cache: bool = False,
     ):
         if cuda_graph and mode != "paged":
             raise ValueError("cuda_graph requires mode='paged'")
@@ -136,6 +151,12 @@ class Engine:
             if tid is not None and tid != self.tokenizer.unk_token_id:
                 self.stop_token_ids.add(tid)
 
+        # ── Milestone 3 knobs ──────────────────────────────────────────
+        self.prefill_chunk_size = max(0, prefill_chunk_size)
+        # ``radix_cache`` is read by the server's /cache_stats endpoint; it
+        # stays None outside paged mode or when disabled.
+        self.radix_cache: RadixCache | None = None
+
         # ── Paged-mode setup (only when mode == "paged") ───────────────
         self.pool: KVMemoryPool | None = None
         self.page_size = page_size
@@ -175,6 +196,15 @@ class Engine:
             self.model.model.rotary_emb.preallocate(
                 max_position, device=device, dtype=dtype
             )
+
+            # Radix prefix cache (Part B) — on by default.  Wire it into the
+            # pool so allocate() can evict LRU pages before raising OOM.
+            if not disable_radix_cache:
+                self.radix_cache = RadixCache(self.pool)
+                self.pool.radix_cache = self.radix_cache
+                logger.info("Radix prefix cache enabled (page_size=%d)", page_size)
+            else:
+                logger.info("Radix prefix cache disabled")
 
             if attention_backend == "flashinfer":
                 import flashinfer
@@ -509,118 +539,264 @@ class Engine:
         return s
 
     def free_paged_state(self, req: Request) -> None:
-        """Release a request's pages back to the pool."""
-        s = self._paged_state.pop(req.request_id, None)
-        if s is not None and s.page_table and self.pool is not None:
-            self.pool.free(s.page_table)
+        """Release a finished request's pages.
 
-    # ── Paged prefill (varlen, packed, no padding) ──────────────────────
+        With the radix cache off, all pages return to the pool.  With it on,
+        the request's full-page KV (prompt + generation) is inserted into the
+        cache so future requests can reuse it; only the redundant duplicate
+        pages and the partial trailing page return to the pool.  The borrowed
+        prefix lock taken at prefill time is released here.
+        """
+        s = self._paged_state.pop(req.request_id, None)
+        if s is None or self.pool is None:
+            return
+
+        if self.radix_cache is None:
+            if s.page_table:
+                self.pool.free(s.page_table)
+            return
+
+        ps = self.page_size
+        # KV exists for every token except the very last sampled output token
+        # (it was never fed back through the model), so it isn't cacheable.
+        tokens = req.input_ids + req.output_ids
+        cacheable = tokens[:-1] if tokens else []
+        n_full_pages = len(cacheable) // ps
+
+        leftover: list[int] = []
+        if n_full_pages > 0:
+            aligned = cacheable[: n_full_pages * ps]
+            cache_pages = s.page_table[:n_full_pages]
+            _leaf, redundant = self.radix_cache.insert_and_return(aligned, cache_pages)
+            leftover.extend(redundant)
+            # Pages past the cached prefix (partial last page + any decode
+            # tail beyond n_full_pages) are not owned by the cache → free them.
+            leftover.extend(s.page_table[n_full_pages:])
+        else:
+            leftover.extend(s.page_table)
+
+        # Release the borrowed-prefix lock taken during prefill.
+        if s.prefix_node is not None:
+            self.radix_cache.dec_lock_ref(s.prefix_node)
+
+        if leftover:
+            self.pool.free(leftover)
+
+    # ── Paged prefill (varlen, packed, chunked, cache-aware) ────────────
 
     @torch.inference_mode()
     def paged_batched_prefill(self, requests: list[Request]) -> list[int]:
-        """Pack N prompts into one varlen forward; sample first token each."""
+        """Prefill a batch of requests; return the first sampled token each.
+
+        Two Milestone-3 features fold into this one path:
+
+        * **Radix cache hit** (Part B) — a request's matched prefix pages are
+          borrowed (read-only) and prefill starts at ``prefix_len`` instead
+          of 0, attending to the borrowed KV.
+        * **Chunked prefill** (Part A) — each request's remaining
+          ``[prefix_len, prompt_len)`` range is processed in slices of at most
+          ``prefill_chunk_size`` query tokens (packed across requests up to
+          that budget), so per-forward activation memory is bounded.
+
+        ``prefill_chunk_size == 0`` ⇒ unbounded budget ⇒ one packed forward
+        over every request's full remaining range (the milestone-2 path).
+        """
         if not requests:
             return []
         assert self.pool is not None
         states = [self._state(r) for r in requests]
+        ps = self.page_size
+
+        # ── 1. Per request: radix match (lock prefix) + page allocation ──
         for r, s in zip(requests, states):
-            s.page_table = self.pool.allocate(self.pool.pages_needed(len(r.input_ids)))
+            n = len(r.input_ids)
+            borrowed: list[int] = []
+            prefix_len = 0
+            node = None
+            if self.radix_cache is not None and n > 0:
+                res = self.radix_cache.match_prefix(r.input_ids)
+                # Keep at least the last token uncached so its next-token
+                # logits get computed; cap the reuse to ``prompt_len - 1``
+                # tokens floored to a page boundary.
+                cap_pages = max(0, (n - 1) // ps)
+                use_pages = min(len(res.matched_pages), cap_pages)
+                if use_pages > 0:
+                    borrowed = res.matched_pages[:use_pages]
+                    prefix_len = use_pages * ps
+                    node = res.last_node
+                    # Lock BEFORE any allocate so eviction can't reclaim the
+                    # borrowed pages out from under this request.
+                    self.radix_cache.inc_lock_ref(node)
+            total_pages = self.pool.pages_needed(n)
+            new_pages = self.pool.allocate(total_pages - len(borrowed))
+            s.page_table = borrowed + new_pages
             s.cache_seq_len = 0
+            s.prefill_pos = prefix_len
+            s.prefix_len = prefix_len
+            s.prefix_node = node
+            r.cache_hit_tokens = prefix_len
 
-        seq_lens = [len(r.input_ids) for r in requests]
-        cu = _cu_seqlens(seq_lens, self.device)
+        # ── 2. Chunked schedule: greedily pack query slices up to budget ──
+        prompt_len = [len(r.input_ids) for r in requests]
+        cursor = [s.prefill_pos for s in states]
+        budget = self.prefill_chunk_size if self.prefill_chunk_size > 0 else None
 
-        flat_ids = [t for r in requests for t in r.input_ids]
-        flat_pos = [p for n in seq_lens for p in range(n)]
-        input_ids = _to_long(flat_ids, self.device).unsqueeze(0)  # (1, T) packed
+        out: list[int] = [0] * len(requests)
+        work = deque(i for i in range(len(requests)) if prompt_len[i] > cursor[i])
+        while work:
+            segs: list[tuple[int, int, int]] = []  # (local_idx, q_start, q_len)
+            remaining = budget
+            while work and (remaining is None or remaining > 0):
+                i = work[0]
+                avail = prompt_len[i] - cursor[i]
+                take = avail if remaining is None else min(avail, remaining)
+                segs.append((i, cursor[i], take))
+                cursor[i] += take
+                if remaining is not None:
+                    remaining -= take
+                if cursor[i] >= prompt_len[i]:
+                    work.popleft()
+                else:
+                    break  # request still has tokens; budget will be spent
+            for local_idx, tok in self._run_prefill_chunk(
+                requests, states, segs, prompt_len
+            ):
+                out[local_idx] = tok
+        return out
+
+    def _run_prefill_chunk(
+        self,
+        requests: list[Request],
+        states: list[_PagedState],
+        segs: list[tuple[int, int, int]],
+        prompt_len: list[int],
+    ) -> list[tuple[int, int]]:
+        """Run one packed varlen forward over ``segs`` and sample the first
+        token for every request that *completes* its prefill in this chunk.
+
+        Each seg is ``(local_idx, q_start, q_len)`` attending to the request's
+        ``[0, q_start + q_len)`` KV.  Returns ``(local_idx, token_id)`` pairs
+        for completing requests.
+        """
+        if not segs:
+            return []
+
+        flat_ids: list[int] = []
+        flat_pos: list[int] = []
+        for local_idx, q_start, q_len in segs:
+            ids = requests[local_idx].input_ids
+            flat_ids.extend(ids[q_start : q_start + q_len])
+            flat_pos.extend(range(q_start, q_start + q_len))
+        input_ids = _to_long(flat_ids, self.device).unsqueeze(0)
         position_ids = _to_long(flat_pos, self.device).unsqueeze(0)
-        last_idx = (cu[1:] - 1).long()
+
+        # Requests that finish prefill in this chunk → gather their last query
+        # position's logits (flat index of the final q token of the seg).
+        completing: list[tuple[int, int]] = []  # (local_idx, flat_last_idx)
+        flat_off = 0
+        for local_idx, q_start, q_len in segs:
+            flat_off += q_len
+            if q_start + q_len >= prompt_len[local_idx]:
+                completing.append((local_idx, flat_off - 1))
+        logits_indices = _to_long([fi for _, fi in completing], self.device)
 
         common = dict(
             kv_pool_caches=self._kv_pool_caches,
-            logits_indices=last_idx,
+            logits_indices=logits_indices,
         )
         if self.attention_backend == "flashinfer":
-            backend_kwargs = self._fi_kwargs_prefill(states, seq_lens)
+            backend_kwargs = self._fi_kwargs_prefill_segmented(states, segs)
         else:
-            backend_kwargs = self._fa_kwargs_prefill(states, seq_lens, cu)
+            backend_kwargs = self._fa_kwargs_prefill_segmented(states, segs)
 
         logits, _ = self.model(input_ids, position_ids, **common, **backend_kwargs)
-        # (1, num_seqs, vocab) thanks to logits_indices
 
-        out: list[int] = []
-        for i, (r, s, n) in enumerate(zip(requests, states, seq_lens)):
-            s.cache_seq_len = n
-            out.append(
-                sample_token(logits[0, i : i + 1], r.sampling_params, r.output_ids)
-            )
-        return out
+        results: list[tuple[int, int]] = []
+        for row, (local_idx, _flat_idx) in enumerate(completing):
+            r = requests[local_idx]
+            s = states[local_idx]
+            s.cache_seq_len = prompt_len[local_idx]
+            tok = sample_token(logits[0, row : row + 1], r.sampling_params, r.output_ids)
+            results.append((local_idx, tok))
+        return results
 
-    # ── Backend-specific prefill metadata builders ─────────────────────
+    # ── Backend-specific prefill metadata builders (segmented) ──────────
 
-    def _fa_kwargs_prefill(
-        self, states: list[_PagedState], seq_lens: list[int], cu: torch.Tensor
+    def _fa_kwargs_prefill_segmented(
+        self, states: list[_PagedState], segs: list[tuple[int, int, int]]
     ) -> dict:
-        """flash_attn varlen prefill metadata: slot_mapping + block_table."""
+        """flash_attn varlen metadata for a packed set of prefill segments."""
         ps = self.page_size
+        q_lens = [q_len for _, _, q_len in segs]
+        kv_lens = [q_start + q_len for _, q_start, q_len in segs]
+
         slot_mapping = _to_long(
             [
-                s.page_table[i // ps] * ps + i % ps
-                for s, n in zip(states, seq_lens)
-                for i in range(n)
+                states[local_idx].page_table[t // ps] * ps + t % ps
+                for local_idx, q_start, q_len in segs
+                for t in range(q_start, q_start + q_len)
             ],
             self.device,
         )
+        # Per-seg page table covers exactly its kv_len tokens; _page_table
+        # pads ragged rows with the scratch page (never read past kv_len).
+        seg_tables = [
+            states[local_idx].page_table[: self.pool.pages_needed(kv)]
+            for (local_idx, _, _), kv in zip(segs, kv_lens)
+        ]
         # max_seqlen_* pinned to max_position (a constant) so torch.compile
-        # doesn't retrace as actual lengths grow.  The kernel uses
-        # cu_seqlens_* for true lengths; max_seqlen_* only sizes the grid.
+        # doesn't retrace as lengths grow.  cu_seqlens_* carry true lengths.
         return dict(
             slot_mapping=slot_mapping,
-            cu_seqlens_q=cu,
-            cu_seqlens_k=cu,
+            cu_seqlens_q=_cu_seqlens(q_lens, self.device),
+            cu_seqlens_k=_cu_seqlens(kv_lens, self.device),
             max_seqlen_q=self.max_position,
             max_seqlen_k=self.max_position,
-            block_table=_page_table([s.page_table for s in states], self.device),
+            block_table=_page_table(seg_tables, self.device),
         )
 
-    def _fi_kwargs_prefill(
-        self, states: list[_PagedState], seq_lens: list[int]
+    def _fi_kwargs_prefill_segmented(
+        self, states: list[_PagedState], segs: list[tuple[int, int, int]]
     ) -> dict:
-        """flashinfer prefill metadata: plan() the wrapper and bundle the
-        per-token append metadata."""
+        """flashinfer prefill metadata for a packed set of prefill segments."""
         assert self._fi_prefill_wrapper is not None
         ps = self.page_size
+        kv_lens = [q_start + q_len for _, q_start, q_len in segs]
 
-        # batch_indices[i], positions[i] tell append_paged_kv_cache where
-        # the i-th token in the packed flat tensor lives in the pool.
+        # batch_indices/positions place each query token's freshly computed
+        # K/V into the pool: position is its absolute index in the request.
         batch_indices = torch.tensor(
-            [b for b, n in enumerate(seq_lens) for _ in range(n)],
+            [b for b, (_, _, q_len) in enumerate(segs) for _ in range(q_len)],
             dtype=torch.int32,
             device=self.device,
         )
         positions = torch.tensor(
-            [p for n in seq_lens for p in range(n)],
+            [
+                t
+                for _, q_start, q_len in segs
+                for t in range(q_start, q_start + q_len)
+            ],
             dtype=torch.int32,
             device=self.device,
         )
 
-        # Per-request KV layout:
-        #   kv_indptr  — prefix sum of pages-per-request  (B+1,)
-        #   kv_indices — flat list of page indices         (sum_pages,)
-        #   kv_last_page_len — fill of the last page       (B,)
-        page_counts = [len(s.page_table) for s in states]
+        page_counts = [self.pool.pages_needed(kv) for kv in kv_lens]
         kv_indptr = _to_int32_cumsum(page_counts, self.device)
         kv_indices = torch.tensor(
-            [p for s in states for p in s.page_table],
+            [
+                p
+                for (local_idx, _, _), pc in zip(segs, page_counts)
+                for p in states[local_idx].page_table[:pc]
+            ],
             dtype=torch.int32,
             device=self.device,
         )
         kv_last_page_len = torch.tensor(
-            [((n - 1) % ps) + 1 if n > 0 else 0 for n in seq_lens],
+            [((kv - 1) % ps) + 1 if kv > 0 else 0 for kv in kv_lens],
             dtype=torch.int32,
             device=self.device,
         )
-        qo_indptr = _to_int32_cumsum(seq_lens, self.device)
+        qo_indptr = _to_int32_cumsum([q_len for _, _, q_len in segs], self.device)
 
         self._fi_prefill_wrapper.plan(
             qo_indptr=qo_indptr,
