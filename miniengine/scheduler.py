@@ -43,10 +43,12 @@ class Scheduler:
         stop()             — gracefully shut down
     """
 
-    def __init__(self, engine: Engine, max_running: int = 16, mode: str = "paged"):
+    def __init__(self, engine: Engine, max_running: int = 16, mode: str = "paged",
+                 use_mapreduce: bool = False):
         self.engine = engine
         self.max_running = max_running
         self.mode = mode
+        self.use_mapreduce = use_mapreduce
 
         # Queues
         self.waiting: deque[Request] = deque()
@@ -61,17 +63,29 @@ class Scheduler:
         self.total_finished: int = 0
         self.total_generated_tokens: int = 0
 
+        # ── Milestone 4: MapReduce session tracking ─────────────────────
+        # session_id → number of requests currently waiting or running for
+        # that session.  The MapReduce priority is 1/active_count: sessions
+        # with fewer active sibling calls (near a fan-in convergence point)
+        # are admitted first, reducing end-to-end session latency.
+        self.session_active: dict[str, int] = {}
+
     # ── Public API (thread-safe) ────────────────────────────────────────
 
     def add_request(self, request: Request) -> None:
         """Enqueue a request for scheduling."""
         with self._lock:
             self.waiting.append(request)
+            if request.session_id:
+                self.session_active[request.session_id] = (
+                    self.session_active.get(request.session_id, 0) + 1
+                )
             logger.info(
-                "Enqueued request %s  (prompt_len=%d, waiting=%d)",
+                "Enqueued request %s  (prompt_len=%d, waiting=%d, session=%s)",
                 request.request_id,
                 request.num_input_tokens,
                 len(self.waiting),
+                request.session_id,
             )
 
     def start(self) -> None:
@@ -201,16 +215,45 @@ class Scheduler:
         with self._lock:
             to_prefill: list[Request] = []
             budget = pool.available_pages
-            while (
-                self.waiting
-                and len(self.running) + len(to_prefill) < self.max_running
-            ):
-                req = self.waiting[0]
-                need = pool.pages_needed(len(req.input_ids))
-                if need > budget:
-                    break  # can't fit; wait for pages to free
-                to_prefill.append(self.waiting.popleft())
-                budget -= need
+
+            if self.use_mapreduce and self.waiting:
+                # MapReduce admission: sort by priority (1/active_count) so
+                # requests from sessions near a fan-in convergence point go
+                # first.  Unlike FIFO, we skip requests that don't fit rather
+                # than stopping — a small high-priority request can jump ahead
+                # of a large low-priority one.
+                candidates = sorted(
+                    self.waiting,
+                    key=lambda r: (
+                        -1.0 / max(self.session_active.get(r.session_id, 1), 1)
+                        if r.session_id else -1.0
+                    ),
+                )
+                admitted_ids: set[str] = set()
+                for req in candidates:
+                    if len(self.running) + len(to_prefill) >= self.max_running:
+                        break
+                    need = pool.pages_needed(len(req.input_ids))
+                    if need > budget:
+                        continue  # skip; try next candidate
+                    to_prefill.append(req)
+                    admitted_ids.add(req.request_id)
+                    budget -= need
+                self.waiting = deque(
+                    r for r in self.waiting if r.request_id not in admitted_ids
+                )
+            else:
+                # Default FIFO admission
+                while (
+                    self.waiting
+                    and len(self.running) + len(to_prefill) < self.max_running
+                ):
+                    req = self.waiting[0]
+                    need = pool.pages_needed(len(req.input_ids))
+                    if need > budget:
+                        break
+                    to_prefill.append(self.waiting.popleft())
+                    budget -= need
 
         if to_prefill:
             for req in to_prefill:
@@ -283,6 +326,10 @@ class Scheduler:
         req.kv_cache = None  # release GPU memory (baseline / batched modes)
         if self.mode == "paged":
             self.engine.free_paged_state(req)
+        if req.session_id and req.session_id in self.session_active:
+            self.session_active[req.session_id] -= 1
+            if self.session_active[req.session_id] <= 0:
+                del self.session_active[req.session_id]
         req.token_queue.put(TokenOutput(token_id=-1, token_text="", finished=True))
         finished_list.append(req)
 

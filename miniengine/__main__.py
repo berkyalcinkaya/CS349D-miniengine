@@ -154,6 +154,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="paged: disable the radix prefix cache (cache is on by default)",
     )
+
+    # ── Milestone-4 flags ───────────────────────────────────────────────
+    p.add_argument(
+        "--mapreduce-scheduling",
+        action="store_true",
+        help="Enable session-aware MapReduce admission priority.  Requests "
+        "from sessions with fewer active concurrent calls (closer to a "
+        "fan-in convergence point) are admitted first, reducing end-to-end "
+        "session latency for agentic fan-out/fan-in workloads.",
+    )
     return p.parse_args()
 
 
@@ -200,7 +210,12 @@ def main() -> None:
         prefill_chunk_size=args.prefill_chunk_size,
         disable_radix_cache=args.disable_radix_cache,
     )
-    sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
+    sched = Scheduler(
+        engine=engine,
+        max_running=args.max_running,
+        mode=args.mode,
+        use_mapreduce=args.mapreduce_scheduling,
+    )
 
     # Wire up the server module globals
     srv.engine = engine

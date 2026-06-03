@@ -32,3 +32,4 @@ miniengine = "miniengine.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+2

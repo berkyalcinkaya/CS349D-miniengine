@@ -55,6 +55,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = Field(default=20)
     repetition_penalty: float | None = Field(default=1.0)
     stream: bool = False
+    user: str | None = None  # session identifier for MapReduce scheduling (M4)
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────
@@ -127,6 +128,7 @@ async def chat_completions(raw: ChatCompletionRequest):
         request_id=str(uuid.uuid4()),
         input_ids=input_ids,
         sampling_params=sampling_params,
+        session_id=raw.user,
     )
     scheduler.add_request(req)
 

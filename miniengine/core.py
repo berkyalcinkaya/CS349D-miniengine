@@ -10,6 +10,8 @@ Key types:
   - TokenOutput: a single streamed token delivered to the client
 """
 
+from __future__ import annotations
+
 import queue
 import time
 from dataclasses import dataclass, field
@@ -66,6 +68,13 @@ class Request:
     # the response's ``usage`` block so clients can record per-request
     # cache effectiveness.
     cache_hit_tokens: int = 0
+
+    # ── Milestone 4: session-aware scheduling ──────────────────────────
+    # Opaque session identifier set from the OpenAI ``user`` field.  When
+    # present the MapReduce scheduler uses it to track how many requests
+    # from the same session are currently active and prioritize sessions
+    # closer to a fan-in convergence point.
+    session_id: str | None = None
 
     # ── Derived properties ─────────────────────────────────────────────
 
